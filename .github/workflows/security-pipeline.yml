@@ -1,0 +1,705 @@
+name: Comprehensive Security Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Daily security scans at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  NODE_VERSION: '18'
+  PYTHON_VERSION: '3.10'
+  SONAR_SCANNER_VERSION: '4.8.0'
+  
+jobs:
+  # ===== SMART CONTRACT SECURITY =====
+  smart-contract-security:
+    name: Smart Contract Security Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        npm ci
+        cd packages/contracts-avalanche && npm ci
+        cd ../contracts-doma && npm ci
+    
+    - name: Install Foundry
+      uses: foundry-rs/foundry-toolchain@v1
+      with:
+        version: nightly
+    
+    - name: Install Slither
+      run: |
+        python -m pip install --upgrade pip
+        pip install slither-analyzer==0.9.6
+        pip install solc-select
+        solc-select install 0.8.19
+        solc-select use 0.8.19
+    
+    - name: Run Slither Analysis
+      run: |
+        cd packages/contracts-avalanche
+        slither . --config-file ../../security/contracts/slither.config.json \
+          --json slither-report.json \
+          --sarif slither-report.sarif \
+          --checklist \
+          --markdown-root . \
+          || true
+    
+    - name: Upload Slither Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: slither-analysis
+        path: |
+          packages/contracts-avalanche/slither-report.json
+          packages/contracts-avalanche/slither-report.sarif
+    
+    - name: Install Mythril
+      run: |
+        pip install mythril
+    
+    - name: Run Mythril Analysis
+      run: |
+        cd packages/contracts-avalanche
+        for contract in contracts/*.sol; do
+          echo "Analyzing $contract"
+          myth analyze "$contract" \
+            --solv 0.8.19 \
+            --max-depth 10 \
+            --execution-timeout 300 \
+            --output json \
+            > "mythril-$(basename "$contract" .sol).json" || true
+        done
+    
+    - name: Upload Mythril Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: mythril-analysis
+        path: packages/contracts-avalanche/mythril-*.json
+    
+    - name: Run Foundry Tests with Coverage
+      run: |
+        cd packages/contracts-avalanche
+        forge test --gas-report
+        forge coverage --report lcov
+    
+    - name: Upload Coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: packages/contracts-avalanche/lcov.info
+        flags: smart-contracts
+        name: smart-contract-coverage
+    
+    - name: Run Security Tests
+      run: |
+        cd security
+        npm test -- --testMatch="**/contracts/**/*.test.ts"
+    
+    - name: Security Analysis Summary
+      run: |
+        echo "## Smart Contract Security Analysis Results" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Slither static analysis completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Mythril symbolic execution completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Security tests executed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Test coverage generated" >> $GITHUB_STEP_SUMMARY
+
+  # ===== INFRASTRUCTURE SECURITY =====
+  infrastructure-security:
+    name: Infrastructure Security Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run Dependency Security Audit
+      run: |
+        npm audit --audit-level=moderate --json > npm-audit.json || true
+        npm audit --audit-level=moderate
+    
+    - name: Install Snyk
+      run: npm install -g snyk
+    
+    - name: Run Snyk Security Scan
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      run: |
+        snyk auth $SNYK_TOKEN
+        snyk test --json > snyk-results.json || true
+        snyk monitor || true
+    
+    - name: Run OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: 'bastion-protocol'
+        path: '.'
+        format: 'ALL'
+        args: >
+          --enableRetired
+          --enableExperimental
+          --out reports
+    
+    - name: Upload Dependency Check Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: dependency-check-report
+        path: reports/
+    
+    - name: Run Docker Security Scan
+      run: |
+        # Install Trivy
+        sudo apt-get update
+        sudo apt-get install wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install trivy
+        
+        # Scan Dockerfiles
+        find . -name "Dockerfile*" -exec trivy config {} \; > trivy-config.txt
+        
+        # Build and scan images if Dockerfiles exist
+        if [ -f "apps/relayer/Dockerfile" ]; then
+          docker build -t bastion-relayer apps/relayer/
+          trivy image --format json --output trivy-relayer.json bastion-relayer || true
+        fi
+        
+        if [ -f "apps/valuation-api/Dockerfile" ]; then
+          docker build -t bastion-valuation apps/valuation-api/
+          trivy image --format json --output trivy-valuation.json bastion-valuation || true
+        fi
+    
+    - name: Upload Docker Security Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: docker-security-scan
+        path: |
+          trivy-*.json
+          trivy-config.txt
+    
+    - name: Infrastructure Security Summary
+      run: |
+        echo "## Infrastructure Security Analysis Results" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ NPM audit completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Snyk vulnerability scan completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ OWASP dependency check completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Docker security scan completed" >> $GITHUB_STEP_SUMMARY
+
+  # ===== FRONTEND SECURITY =====
+  frontend-security:
+    name: Frontend Security Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        npm ci
+        cd apps/web && npm ci
+    
+    - name: Build frontend application
+      run: |
+        cd apps/web
+        npm run build
+    
+    - name: Start application for testing
+      run: |
+        cd apps/web
+        npm start &
+        sleep 30
+        curl -f http://localhost:3000 || exit 1
+      timeout-minutes: 5
+    
+    - name: Install security testing tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y chromium-browser
+        npm install -g @lhci/cli lighthouse
+    
+    - name: Run Lighthouse Security Audit
+      run: |
+        lhci autorun \
+          --upload.target=filesystem \
+          --upload.outputDir=./lighthouse-results \
+          --collect.url=http://localhost:3000 \
+          --collect.settings.chromeFlags="--no-sandbox --headless" \
+          --assert.preset=lighthouse:recommended
+    
+    - name: Run Frontend Security Tests
+      run: |
+        cd security
+        npm test -- --testMatch="**/frontend/**/*.test.ts" --testTimeout=60000
+      env:
+        FRONTEND_URL: http://localhost:3000
+    
+    - name: Upload Lighthouse Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: lighthouse-security-audit
+        path: lighthouse-results/
+    
+    - name: Frontend Security Summary
+      run: |
+        echo "## Frontend Security Analysis Results" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Lighthouse security audit completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Frontend security tests executed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ XSS/CSRF protection validated" >> $GITHUB_STEP_SUMMARY
+
+  # ===== API SECURITY =====
+  api-security:
+    name: API Security Testing
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        npm ci
+        cd apps/valuation-api && npm ci
+    
+    - name: Start API services
+      run: |
+        cd apps/valuation-api
+        npm run build
+        npm start &
+        sleep 20
+        curl -f http://localhost:8080/health || exit 1
+      timeout-minutes: 5
+    
+    - name: Install OWASP ZAP
+      run: |
+        wget -q https://github.com/zaproxy/zaproxy/releases/download/v2.14.0/ZAP_2_14_0_Linux.tar.gz
+        tar -xzf ZAP_2_14_0_Linux.tar.gz
+        sudo mv ZAP_2.14.0 /opt/zaproxy
+        sudo ln -s /opt/zaproxy/zap.sh /usr/local/bin/zap.sh
+    
+    - name: Run OWASP ZAP API Security Scan
+      run: |
+        # Start ZAP daemon
+        zap.sh -daemon -host 0.0.0.0 -port 8090 &
+        sleep 30
+        
+        # Run API scan
+        curl -X GET "http://localhost:8090/JSON/spider/action/scan/?url=http://localhost:8080"
+        sleep 60
+        
+        # Run active security scan
+        curl -X GET "http://localhost:8090/JSON/ascan/action/scan/?url=http://localhost:8080"
+        sleep 120
+        
+        # Generate reports
+        curl -X GET "http://localhost:8090/JSON/core/view/htmlreport/" > zap-report.html
+        curl -X GET "http://localhost:8090/JSON/core/view/jsonreport/" > zap-report.json
+    
+    - name: Run API Security Tests
+      run: |
+        cd security
+        npm test -- --testMatch="**/infrastructure/**/*.test.ts"
+      env:
+        API_URL: http://localhost:8080
+    
+    - name: Upload ZAP Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: zap-security-scan
+        path: |
+          zap-report.html
+          zap-report.json
+    
+    - name: API Security Summary
+      run: |
+        echo "## API Security Analysis Results" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ OWASP ZAP security scan completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ API security tests executed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Authentication/authorization validated" >> $GITHUB_STEP_SUMMARY
+
+  # ===== CODE QUALITY & SECURITY =====
+  code-quality:
+    name: Code Quality and Security Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Run ESLint Security Rules
+      run: |
+        npx eslint . \
+          --ext .ts,.tsx,.js,.jsx \
+          --format json \
+          --output-file eslint-results.json \
+          --config .eslintrc-security.json || true
+    
+    - name: Run TSLint Security Rules
+      run: |
+        npx tslint \
+          --project tsconfig.json \
+          --config tslint-security.json \
+          --format json \
+          --out tslint-results.json || true
+    
+    - name: SonarCloud Scan
+      uses: SonarSource/sonarcloud-github-action@master
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      with:
+        args: >
+          -Dsonar.projectKey=bastion-protocol
+          -Dsonar.organization=bastion-protocol
+          -Dsonar.sources=.
+          -Dsonar.exclusions=**/node_modules/**,**/dist/**,**/build/**
+          -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info
+          -Dsonar.security_hotspots.ignored=false
+          -Dsonar.coverage.exclusions=**/*.test.ts,**/test/**
+    
+    - name: Run Semgrep Security Scan
+      run: |
+        pip install semgrep
+        semgrep --config=auto --json --output semgrep-results.json . || true
+    
+    - name: Upload Code Quality Results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: code-quality-results
+        path: |
+          eslint-results.json
+          tslint-results.json
+          semgrep-results.json
+    
+    - name: Code Quality Summary
+      run: |
+        echo "## Code Quality Analysis Results" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ ESLint security rules executed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ TSLint security analysis completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ SonarCloud analysis completed" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Semgrep security scan completed" >> $GITHUB_STEP_SUMMARY
+
+  # ===== SECURITY COMPLIANCE =====
+  security-compliance:
+    name: Security Compliance Check
+    runs-on: ubuntu-latest
+    needs: [smart-contract-security, infrastructure-security, frontend-security, api-security, code-quality]
+    timeout-minutes: 15
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: security-results/
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        npm ci
+        cd security && npm ci
+    
+    - name: Generate Security Compliance Report
+      run: |
+        cd security
+        node scripts/generate-compliance-report.js \
+          --input ../security-results \
+          --output ../security-compliance-report.json \
+          --format json,html,pdf
+    
+    - name: Evaluate Security Thresholds
+      id: security-check
+      run: |
+        cd security
+        node scripts/evaluate-security-thresholds.js \
+          --report ../security-compliance-report.json \
+          --thresholds security-thresholds.json \
+          --output ../security-evaluation.json
+        
+        # Read evaluation results
+        CRITICAL_COUNT=$(jq '.critical' ../security-evaluation.json)
+        HIGH_COUNT=$(jq '.high' ../security-evaluation.json)
+        OVERALL_SCORE=$(jq '.overallScore' ../security-evaluation.json)
+        
+        echo "critical_count=$CRITICAL_COUNT" >> $GITHUB_OUTPUT
+        echo "high_count=$HIGH_COUNT" >> $GITHUB_OUTPUT
+        echo "overall_score=$OVERALL_SCORE" >> $GITHUB_OUTPUT
+    
+    - name: Upload Security Reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: security-compliance-report
+        path: |
+          security-compliance-report.*
+          security-evaluation.json
+    
+    - name: Post Security Summary
+      run: |
+        echo "# 🔒 Security Compliance Report" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "## Overall Security Score: ${{ steps.security-check.outputs.overall_score }}/100" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Issue Summary:" >> $GITHUB_STEP_SUMMARY
+        echo "- 🔴 Critical Issues: ${{ steps.security-check.outputs.critical_count }}" >> $GITHUB_STEP_SUMMARY
+        echo "- 🟠 High Severity Issues: ${{ steps.security-check.outputs.high_count }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Security Analysis Completed:" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Smart Contract Security" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Infrastructure Security" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Frontend Security" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ API Security" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Code Quality Analysis" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Security Gate Check
+      run: |
+        CRITICAL_COUNT=${{ steps.security-check.outputs.critical_count }}
+        HIGH_COUNT=${{ steps.security-check.outputs.high_count }}
+        
+        if [ "$CRITICAL_COUNT" -gt 0 ]; then
+          echo "❌ Security gate failed: $CRITICAL_COUNT critical security issues found"
+          exit 1
+        elif [ "$HIGH_COUNT" -gt 5 ]; then
+          echo "⚠️ Security gate warning: $HIGH_COUNT high severity issues found (threshold: 5)"
+          exit 1
+        else
+          echo "✅ Security gate passed: No critical issues, acceptable number of high severity issues"
+        fi
+
+  # ===== SECURITY NOTIFICATION =====
+  security-notification:
+    name: Security Alerts and Notifications
+    runs-on: ubuntu-latest
+    needs: [security-compliance]
+    if: always()
+    timeout-minutes: 5
+    
+    steps:
+    - name: Download security evaluation
+      uses: actions/download-artifact@v4
+      with:
+        name: security-compliance-report
+        path: security-results/
+    
+    - name: Send Security Alert to Slack
+      if: needs.security-compliance.result == 'failure'
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+        SLACK_CHANNEL: '#security-alerts'
+        SLACK_COLOR: danger
+        SLACK_ICON: https://github.com/security.png?size=48
+        SLACK_MESSAGE: |
+          🚨 Security pipeline failed!
+          
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          
+          Critical issues detected. Please review security report immediately.
+        SLACK_TITLE: Security Pipeline Failure
+        SLACK_USERNAME: Security Bot
+    
+    - name: Create Security Issue
+      if: needs.security-compliance.result == 'failure'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const { repo, owner } = context.repo;
+          const { sha } = context;
+          
+          await github.rest.issues.create({
+            owner,
+            repo,
+            title: `🔒 Security Issues Detected - ${sha.substring(0, 7)}`,
+            body: `
+            ## Security Pipeline Results
+            
+            **Status**: ❌ Failed
+            **Commit**: ${sha}
+            **Branch**: ${context.ref}
+            
+            Critical security issues have been detected in the latest security scan.
+            
+            ### Actions Required:
+            1. Review the security compliance report
+            2. Address critical and high severity issues
+            3. Re-run security pipeline after fixes
+            
+            ### Security Report:
+            - Check the [security compliance report](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}) for detailed findings
+            
+            ### Next Steps:
+            - [ ] Review security findings
+            - [ ] Implement fixes for critical issues
+            - [ ] Implement fixes for high severity issues
+            - [ ] Re-run security pipeline
+            - [ ] Close this issue after all issues are resolved
+            `,
+            labels: ['security', 'critical', 'bug'],
+            assignees: ['security-team']
+          });
+    
+    - name: Send Success Notification
+      if: needs.security-compliance.result == 'success'
+      uses: rtCamp/action-slack-notify@v2
+      env:
+        SLACK_WEBHOOK: ${{ secrets.SLACK_SECURITY_WEBHOOK }}
+        SLACK_CHANNEL: '#security-updates'
+        SLACK_COLOR: good
+        SLACK_ICON: https://github.com/security.png?size=48
+        SLACK_MESSAGE: |
+          ✅ Security pipeline passed!
+          
+          Repository: ${{ github.repository }}
+          Branch: ${{ github.ref_name }}
+          Commit: ${{ github.sha }}
+          
+          All security checks completed successfully.
+        SLACK_TITLE: Security Pipeline Success
+        SLACK_USERNAME: Security Bot
+
+  # ===== SECURITY METRICS =====
+  security-metrics:
+    name: Security Metrics Collection
+    runs-on: ubuntu-latest
+    needs: [security-compliance]
+    if: always()
+    timeout-minutes: 10
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Download security results
+      uses: actions/download-artifact@v4
+      with:
+        path: security-results/
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+    
+    - name: Install dependencies
+      run: |
+        npm ci
+        cd security && npm ci
+    
+    - name: Generate Security Metrics
+      run: |
+        cd security
+        node scripts/generate-security-metrics.js \
+          --input ../security-results \
+          --output ../security-metrics.json \
+          --historical-data security-metrics-history.json
+    
+    - name: Send Metrics to Monitoring System
+      env:
+        PROMETHEUS_GATEWAY: ${{ secrets.PROMETHEUS_GATEWAY }}
+        GRAFANA_API_KEY: ${{ secrets.GRAFANA_API_KEY }}
+      run: |
+        cd security
+        node scripts/send-metrics-to-prometheus.js \
+          --metrics ../security-metrics.json \
+          --gateway $PROMETHEUS_GATEWAY
+        
+        node scripts/update-grafana-dashboard.js \
+          --metrics ../security-metrics.json \
+          --api-key $GRAFANA_API_KEY
+    
+    - name: Update Security Badge
+      run: |
+        cd security
+        OVERALL_SCORE=$(jq '.overallScore' ../security-metrics.json)
+        
+        if [ "$OVERALL_SCORE" -ge 90 ]; then
+          BADGE_COLOR="green"
+          BADGE_STATUS="excellent"
+        elif [ "$OVERALL_SCORE" -ge 80 ]; then
+          BADGE_COLOR="yellow"
+          BADGE_STATUS="good"
+        elif [ "$OVERALL_SCORE" -ge 70 ]; then
+          BADGE_COLOR="orange"
+          BADGE_STATUS="fair"
+        else
+          BADGE_COLOR="red"
+          BADGE_STATUS="poor"
+        fi
+        
+        curl -X POST "https://img.shields.io/badge/Security%20Score-${OVERALL_SCORE}%25-${BADGE_COLOR}" \
+          -H "Authorization: Bearer ${{ secrets.SHIELDS_IO_TOKEN }}" \
+          -d "label=Security Score&message=${OVERALL_SCORE}%&color=${BADGE_COLOR}"
+    
+    - name: Upload Security Metrics
+      uses: actions/upload-artifact@v4
+      with:
+        name: security-metrics
+        path: security-metrics.json

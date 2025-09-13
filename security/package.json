@@ -1,0 +1,82 @@
+{
+  "name": "bastion-security-testing",
+  "version": "1.0.0",
+  "description": "Comprehensive security testing suite for Bastion Protocol",
+  "private": true,
+  "scripts": {
+    "security:all": "npm run security:contracts && npm run security:infrastructure && npm run security:frontend",
+    "security:contracts": "npm run contracts:static && npm run contracts:formal && npm run contracts:dynamic",
+    "security:infrastructure": "npm run infra:api && npm run infra:database && npm run infra:network",
+    "security:frontend": "npm run frontend:xss && npm run frontend:wallet && npm run frontend:validation",
+    
+    "contracts:static": "npm run slither:analyze && npm run mythx:analyze",
+    "contracts:formal": "npm run certora:verify && npm run manticore:analyze",
+    "contracts:dynamic": "npm run echidna:fuzz && npm run foundry:invariant",
+    "contracts:report": "node scripts/generate-security-report.js contracts",
+    
+    "slither:analyze": "slither packages/contracts-doma/contracts/ --json slither-report.json",
+    "mythx:analyze": "mythx analyze packages/contracts-doma/artifacts/",
+    "certora:verify": "certoraRun security/contracts/certora-specs/*.spec",
+    "manticore:analyze": "manticore security/contracts/manticore-tests/",
+    "echidna:fuzz": "echidna-test security/contracts/echidna-tests/",
+    "foundry:invariant": "forge test --match-test invariant",
+    
+    "infra:api": "npm run api:owasp && npm run api:sqlmap && npm run api:burp",
+    "infra:database": "npm run db:sqlmap && npm run db:security-scan",
+    "infra:network": "npm run nmap:scan && npm run nessus:scan",
+    "infra:report": "node scripts/generate-security-report.js infrastructure",
+    
+    "api:owasp": "zap-baseline.py -t http://localhost:3002",
+    "api:sqlmap": "sqlmap -u 'http://localhost:3002/api/*' --batch --level=3",
+    "api:burp": "java -jar burp-suite-pro.jar --config-file=security/configs/burp-config.json",
+    "db:sqlmap": "sqlmap -d 'postgresql://test_user:test_password@localhost:5433/bastion_test' --batch",
+    "db:security-scan": "node security/infrastructure/database-security.js",
+    "nmap:scan": "nmap -sS -O localhost",
+    "nessus:scan": "node security/infrastructure/nessus-scan.js",
+    
+    "frontend:xss": "node security/frontend/xss-testing.js",
+    "frontend:wallet": "node security/frontend/wallet-security.js",
+    "frontend:validation": "node security/frontend/input-validation.js",
+    "frontend:report": "node scripts/generate-security-report.js frontend",
+    
+    "monitor:start": "node security/monitoring/security-monitor.js",
+    "alert:setup": "node security/monitoring/setup-alerts.js",
+    "incident:response": "node security/incident-response/incident-handler.js",
+    
+    "report:comprehensive": "node scripts/comprehensive-security-report.js",
+    "compliance:check": "node security/compliance/compliance-checker.js"
+  },
+  "dependencies": {
+    "axios": "^1.11.0",
+    "ethers": "^6.15.0",
+    "web3": "^4.9.0",
+    "slither-analyzer": "^0.8.0",
+    "mythx-cli": "^1.9.0",
+    "echidna": "^2.2.0",
+    "manticore": "^0.3.7",
+    "burp-rest-api": "^2.1.0",
+    "sqlmap": "^1.7.0",
+    "owasp-zap": "^2.14.0",
+    "nessus": "^1.2.0",
+    "puppeteer": "^21.0.0",
+    "selenium-webdriver": "^4.15.0",
+    "helmet": "^7.0.0",
+    "express-rate-limit": "^6.10.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "validator": "^13.11.0",
+    "xss": "^1.0.14",
+    "csrf": "^3.1.0",
+    "winston": "^3.10.0",
+    "prometheus-client": "^15.0.0",
+    "node-cron": "^3.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/jest": "^29.0.0",
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.0",
+    "jest": "^29.0.0",
+    "supertest": "^6.3.0"
+  }
+}
