@@ -43,24 +43,58 @@ export async function deployBastionProtocolFixture(): Promise<{
   const bastionProtocol = await BastionProtocol.deploy();
   await bastionProtocol.waitForDeployment();
 
+  // Deploy Mock Circle Implementation for CircleFactory
+  const MockCircleImpl = await ethers.getContractFactory("MockVault");
+  const mockCircleImpl = await MockCircleImpl.deploy();
+  await mockCircleImpl.waitForDeployment();
+
+  // Deploy Mock Registry for CircleFactory
+  const mockRegistryAddress = await signers.admin.getAddress(); // Use admin as mock registry
+
   // Deploy CircleFactory
   const CircleFactory = await ethers.getContractFactory("CircleFactory");
-  const circleFactory = await CircleFactory.deploy();
+  const circleFactory = await CircleFactory.deploy(
+    await mockCircleImpl.getAddress(),
+    mockRegistryAddress
+  );
   await circleFactory.waitForDeployment();
 
-  // Deploy CircleTreasury
+  // Deploy MockERC20 for testing
+  const MockERC20 = await ethers.getContractFactory("MockERC20");
+  const mockUSDC = await MockERC20.deploy("Mock USDC", "mUSDC");
+  await mockUSDC.waitForDeployment();
+
+  // Deploy MockERC721 for testing
+  const MockERC721 = await ethers.getContractFactory("MockERC721");
+  const mockDomainNFT = await MockERC721.deploy("Mock Domain NFT", "mDNFT");
+  await mockDomainNFT.waitForDeployment();
+
+  // Deploy CircleTreasury with required parameters
   const CircleTreasury = await ethers.getContractFactory("CircleTreasury");
-  const circleTreasury = await CircleTreasury.deploy();
+  const signerAddresses = [await signers.admin.getAddress(), await signers.deployer.getAddress()];
+  const circleTreasury = await CircleTreasury.deploy(
+    await mockUSDC.getAddress(),
+    await signers.admin.getAddress(), // adapter placeholder
+    signerAddresses,
+    1 // required signatures
+  );
   await circleTreasury.waitForDeployment();
 
-  // Deploy CircleVault
+  // Deploy CircleVault with required parameters
   const CircleVault = await ethers.getContractFactory("CircleVault");
-  const circleVault = await CircleVault.deploy();
+  const circleVault = await CircleVault.deploy(
+    await mockDomainNFT.getAddress(),
+    signerAddresses,
+    1 // required signatures
+  );
   await circleVault.waitForDeployment();
 
-  // Deploy AuctionAdapter
+  // Deploy AuctionAdapter with required parameters
   const AuctionAdapter = await ethers.getContractFactory("AuctionAdapter");
-  const auctionAdapter = await AuctionAdapter.deploy();
+  const auctionAdapter = await AuctionAdapter.deploy(
+    await signers.admin.getAddress(), // auction placeholder
+    await circleVault.getAddress()
+  );
   await auctionAdapter.waitForDeployment();
 
   const contracts: DeployedContracts = {
@@ -201,9 +235,17 @@ export async function deployMinimalFixture(): Promise<{
 }> {
   const signers = await getTestSigners();
   
+  // Deploy Mock Circle Implementation for CircleFactory
+  const MockCircleImpl = await ethers.getContractFactory("MockVault");
+  const mockCircleImpl = await MockCircleImpl.deploy();
+  await mockCircleImpl.waitForDeployment();
+
   // Deploy only essential contracts for focused testing
   const CircleFactory = await ethers.getContractFactory("CircleFactory");
-  const circleFactory = await CircleFactory.deploy();
+  const circleFactory = await CircleFactory.deploy(
+    await mockCircleImpl.getAddress(),
+    await signers.admin.getAddress() // Use admin as mock registry
+  );
   await circleFactory.waitForDeployment();
 
   const contracts: Partial<DeployedContracts> = {
@@ -211,4 +253,14 @@ export async function deployMinimalFixture(): Promise<{
   };
 
   return { contracts, signers };
+}
+
+/**
+ * Deploy full system for integration testing
+ */
+export async function deployFullFixture(): Promise<{
+  contracts: DeployedContracts;
+  signers: TestSigners;
+}> {
+  return await deployBastionProtocolFixture();
 }

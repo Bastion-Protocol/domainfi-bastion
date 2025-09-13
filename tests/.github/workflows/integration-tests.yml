@@ -1,0 +1,485 @@
+name: End-to-End Integration Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  NODE_VERSION: '18'
+  POSTGRES_DB: bastion_test
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  REDIS_URL: redis://localhost:6379
+
+jobs:
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+
+      - name: Install Dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          cd tests && pnpm install --frozen-lockfile
+
+      - name: Setup Test Environment
+        run: |
+          # Copy test environment configuration
+          cp tests/.env.test.example tests/.env.test
+          
+          # Initialize test databases
+          cd tests && pnpm run db:setup
+
+      - name: Start Test Services
+        run: |
+          cd tests
+          docker-compose -f docker/docker-compose.test.yml up -d
+          
+          # Wait for services to be ready
+          ./scripts/wait-for-services.sh
+
+      - name: Compile Contracts
+        run: |
+          cd packages/contracts-doma
+          pnpm run compile
+          cd ../contracts-avalanche
+          pnpm run compile
+
+      - name: Run Cross-Chain Integration Tests
+        run: |
+          cd tests
+          pnpm run test:cross-chain
+        env:
+          CI: true
+          TEST_TIMEOUT: 300000
+
+      - name: Run Relayer Integration Tests
+        run: |
+          cd tests
+          pnpm run test:relayer
+        env:
+          CI: true
+          TEST_TIMEOUT: 180000
+
+      - name: Run API Integration Tests
+        run: |
+          cd tests
+          pnpm run test:api
+        env:
+          CI: true
+          TEST_TIMEOUT: 120000
+
+      - name: Run Performance Tests
+        run: |
+          cd tests
+          pnpm run test:performance
+        env:
+          CI: true
+          TEST_TIMEOUT: 360000
+          PERFORMANCE_MODE: ci
+
+      - name: Generate Test Reports
+        if: always()
+        run: |
+          cd tests
+          pnpm run test:report
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ github.run_id }}
+          path: |
+            tests/coverage/
+            tests/reports/
+            tests/logs/
+          retention-days: 7
+
+      - name: Upload Coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v3
+        with:
+          directory: tests/coverage
+          flags: integration
+          name: integration-tests
+
+      - name: Cleanup Test Environment
+        if: always()
+        run: |
+          cd tests
+          docker-compose -f docker/docker-compose.test.yml down -v
+
+  performance-benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    if: github.event_name == 'schedule' || contains(github.event.pull_request.labels.*.name, 'performance')
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+
+      - name: Install Dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          cd tests && pnpm install --frozen-lockfile
+
+      - name: Setup Performance Test Environment
+        run: |
+          cp tests/.env.performance.example tests/.env.test
+          cd tests && pnpm run db:setup
+
+      - name: Start Performance Test Services
+        run: |
+          cd tests
+          docker-compose -f docker/docker-compose.performance.yml up -d
+          ./scripts/wait-for-services.sh
+
+      - name: Run Performance Benchmarks
+        run: |
+          cd tests
+          pnpm run test:performance:full
+        env:
+          CI: true
+          PERFORMANCE_MODE: benchmark
+          TEST_TIMEOUT: 600000
+
+      - name: Generate Performance Report
+        if: always()
+        run: |
+          cd tests
+          pnpm run performance:report
+
+      - name: Upload Performance Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-results-${{ github.run_id }}
+          path: |
+            tests/performance-reports/
+            tests/benchmarks/
+          retention-days: 30
+
+      - name: Comment Performance Results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = './tests/performance-reports/summary.json';
+            
+            if (fs.existsSync(path)) {
+              const report = JSON.parse(fs.readFileSync(path, 'utf8'));
+              
+              const comment = `## 📊 Performance Test Results
+            
+              ### Summary
+              - **Total Tests**: ${report.totalTests}
+              - **Success Rate**: ${(report.successRate * 100).toFixed(2)}%
+              - **Average Response Time**: ${report.averageResponseTime}ms
+              - **Throughput**: ${report.throughput.toFixed(2)} req/s
+              
+              ### Key Metrics
+              | Metric | Value | Threshold | Status |
+              |--------|-------|-----------|--------|
+              | Error Rate | ${(report.errorRate * 100).toFixed(2)}% | < 5% | ${report.errorRate < 0.05 ? '✅ Pass' : '❌ Fail'} |
+              | 95th Percentile | ${report.p95ResponseTime}ms | < 10s | ${report.p95ResponseTime < 10000 ? '✅ Pass' : '❌ Fail'} |
+              | Gas Efficiency | ${(report.gasEfficiency * 100).toFixed(2)}% | > 80% | ${report.gasEfficiency > 0.8 ? '✅ Pass' : '❌ Fail'} |
+              
+              ### Detailed Results
+              See the full performance report in the build artifacts.
+              `;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
+
+      - name: Cleanup Performance Environment
+        if: always()
+        run: |
+          cd tests
+          docker-compose -f docker/docker-compose.performance.yml down -v
+
+  security-tests:
+    name: Security Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+
+      - name: Install Dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          cd tests && pnpm install --frozen-lockfile
+
+      - name: Run Security Tests
+        run: |
+          cd tests
+          pnpm run test:security
+        env:
+          CI: true
+
+      - name: Upload Security Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-results-${{ github.run_id }}
+          path: tests/security-reports/
+          retention-days: 30
+
+  staging-deployment-tests:
+    name: Staging Deployment Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: github.ref == 'refs/heads/develop'
+    needs: [integration-tests]
+
+    environment:
+      name: staging
+      url: https://staging.bastion.example.com
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          cd tests && pnpm install --frozen-lockfile
+
+      - name: Deploy to Staging
+        run: |
+          # Deploy services to staging environment
+          cd scripts
+          ./deploy-staging.sh
+        env:
+          STAGING_DB_URL: ${{ secrets.STAGING_DB_URL }}
+          STAGING_REDIS_URL: ${{ secrets.STAGING_REDIS_URL }}
+          STAGING_RPC_URL_DOMA: ${{ secrets.STAGING_RPC_URL_DOMA }}
+          STAGING_RPC_URL_AVALANCHE: ${{ secrets.STAGING_RPC_URL_AVALANCHE }}
+
+      - name: Run Staging Integration Tests
+        run: |
+          cd tests
+          pnpm run test:staging
+        env:
+          CI: true
+          STAGING_API_URL: https://staging-api.bastion.example.com
+          STAGING_WS_URL: wss://staging-ws.bastion.example.com
+
+      - name: Validate Staging Health
+        run: |
+          cd tests
+          pnpm run test:health-check
+        env:
+          TARGET_ENV: staging
+
+      - name: Upload Staging Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-test-results-${{ github.run_id }}
+          path: tests/staging-reports/
+          retention-days: 14
+
+  production-smoke-tests:
+    name: Production Smoke Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: github.ref == 'refs/heads/main'
+    needs: [integration-tests]
+
+    environment:
+      name: production
+      url: https://bastion.example.com
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: |
+          cd tests && pnpm install --frozen-lockfile
+
+      - name: Run Production Smoke Tests
+        run: |
+          cd tests
+          pnpm run test:smoke
+        env:
+          CI: true
+          PRODUCTION_API_URL: ${{ secrets.PRODUCTION_API_URL }}
+          PRODUCTION_WS_URL: ${{ secrets.PRODUCTION_WS_URL }}
+
+      - name: Validate Production Health
+        run: |
+          cd tests
+          pnpm run test:health-check
+        env:
+          TARGET_ENV: production
+
+      - name: Upload Production Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-test-results-${{ github.run_id }}
+          path: tests/production-reports/
+          retention-days: 30
+
+      - name: Notify on Failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Production Smoke Tests Failed - ${context.sha.slice(0, 7)}`,
+              body: `Production smoke tests failed for commit ${context.sha}.\n\nPlease check the test results and take immediate action.`,
+              labels: ['bug', 'critical', 'production']
+            });
+
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [integration-tests, performance-benchmarks, security-tests]
+
+    steps:
+      - name: Generate Test Summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const jobs = [
+              { name: 'Integration Tests', conclusion: '${{ needs.integration-tests.result }}' },
+              { name: 'Performance Benchmarks', conclusion: '${{ needs.performance-benchmarks.result }}' },
+              { name: 'Security Tests', conclusion: '${{ needs.security-tests.result }}' }
+            ];
+
+            const summary = jobs.map(job => {
+              const icon = job.conclusion === 'success' ? '✅' : 
+                          job.conclusion === 'failure' ? '❌' : 
+                          job.conclusion === 'skipped' ? '⏭️' : '🟡';
+              return `${icon} ${job.name}: ${job.conclusion}`;
+            }).join('\n');
+
+            const overallStatus = jobs.every(job => job.conclusion === 'success' || job.conclusion === 'skipped') ? 
+              '✅ All tests passed' : '❌ Some tests failed';
+
+            core.summary
+              .addHeading('🧪 E2E Integration Test Summary')
+              .addRaw(summary)
+              .addSeparator()
+              .addRaw(`**Overall Status**: ${overallStatus}`)
+              .write();

@@ -1,29 +1,27 @@
 import { expect } from "chai";
-import { ethers, deployments, getNamedAccounts } from "hardhat";
+import { ethers } from "hardhat";
+import { loadFixture } from "@nomicfoundation/hardhat-network-helpers";
 import { BastionProtocol } from "../typechain-types";
 
 describe("BastionProtocol", function () {
-  let bastionProtocol: BastionProtocol;
-  let deployer: string;
-  let user1: string;
+  async function deployBastionProtocolFixture() {
+    const [deployer, user1, user2] = await ethers.getSigners();
 
-  beforeEach(async function () {
-    await deployments.fixture(["BastionProtocol"]);
-    const accounts = await getNamedAccounts();
-    deployer = accounts.deployer;
-    
-    const signers = await ethers.getSigners();
-    user1 = signers[1].address;
+    const BastionProtocol = await ethers.getContractFactory("BastionProtocol");
+    const bastionProtocol = await BastionProtocol.deploy();
+    await bastionProtocol.waitForDeployment();
 
-    bastionProtocol = await ethers.getContract("BastionProtocol");
-  });
+    return { bastionProtocol, deployer, user1, user2 };
+  }
 
   describe("Deployment", function () {
     it("Should set the right owner", async function () {
-      expect(await bastionProtocol.owner()).to.equal(deployer);
+      const { bastionProtocol, deployer } = await loadFixture(deployBastionProtocolFixture);
+      expect(await bastionProtocol.owner()).to.equal(deployer.address);
     });
 
     it("Should initialize with zero total value locked", async function () {
+      const { bastionProtocol } = await loadFixture(deployBastionProtocolFixture);
       expect(await bastionProtocol.totalValueLocked()).to.equal(0);
     });
   });
@@ -32,21 +30,23 @@ describe("BastionProtocol", function () {
     const mockTokenAddress = "0x1234567890123456789012345678901234567890";
 
     it("Should allow owner to add supported token", async function () {
+      const { bastionProtocol } = await loadFixture(deployBastionProtocolFixture);
       await bastionProtocol.addSupportedToken(mockTokenAddress);
       expect(await bastionProtocol.supportedTokens(mockTokenAddress)).to.be.true;
     });
 
     it("Should allow owner to remove supported token", async function () {
+      const { bastionProtocol } = await loadFixture(deployBastionProtocolFixture);
       await bastionProtocol.addSupportedToken(mockTokenAddress);
       await bastionProtocol.removeSupportedToken(mockTokenAddress);
       expect(await bastionProtocol.supportedTokens(mockTokenAddress)).to.be.false;
     });
 
     it("Should not allow non-owner to add supported token", async function () {
-      const [, user] = await ethers.getSigners();
+      const { bastionProtocol, user1 } = await loadFixture(deployBastionProtocolFixture);
       await expect(
-        bastionProtocol.connect(user).addSupportedToken(mockTokenAddress)
-      ).to.be.revertedWith("Ownable: caller is not the owner");
+        bastionProtocol.connect(user1).addSupportedToken(mockTokenAddress)
+      ).to.be.revertedWithCustomError(bastionProtocol, "OwnableUnauthorizedAccount");
     });
   });
 
@@ -54,7 +54,8 @@ describe("BastionProtocol", function () {
     const mockTokenAddress = "0x1234567890123456789012345678901234567890";
 
     it("Should return zero balance for new user", async function () {
-      const balance = await bastionProtocol.getUserBalance(user1, mockTokenAddress);
+      const { bastionProtocol, user1 } = await loadFixture(deployBastionProtocolFixture);
+      const balance = await bastionProtocol.getUserBalance(user1.address, mockTokenAddress);
       expect(balance).to.equal(0);
     });
   });

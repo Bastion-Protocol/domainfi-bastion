@@ -48,7 +48,7 @@ describe("CircleTreasury", function () {
 
   it("should pause and unpause", async () => {
     await treasury.pause();
-    await expect(treasury.connect(user).deposit(1000)).to.be.revertedWith("Pausable: paused");
+    await expect(treasury.connect(user).deposit(1000)).to.be.revertedWithCustomError(treasury, "EnforcedPause");
     await treasury.unpause();
     await treasury.connect(user).deposit(1000);
     expect(await usdc.balanceOf(await treasury.getAddress())).to.equal(1000);

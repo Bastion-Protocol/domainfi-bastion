@@ -1,0 +1,169 @@
+version: '3.8'
+
+services:
+  # PostgreSQL for Relayer service testing
+  postgres-test:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
+      POSTGRES_DB: bastion_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user -d bastion_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for job queues and caching
+  redis-test:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_test_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Local Ethereum network for DOMA chain
+  doma-chain:
+    image: trufflesuite/ganache:latest
+    ports:
+      - "8545:8545"
+    command: >
+      --accounts 20
+      --deterministic
+      --host 0.0.0.0
+      --port 8545
+      --chainId 31337
+      --networkId 31337
+      --gasLimit 12000000
+      --gasPrice 1000000000
+      --defaultBalanceEther 1000
+      --unlock 0
+      --secure false
+      --db /data
+    volumes:
+      - doma_chain_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8545 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Local Ethereum network for Avalanche chain simulation
+  avalanche-chain:
+    image: trufflesuite/ganache:latest
+    ports:
+      - "8546:8545"
+    command: >
+      --accounts 20
+      --deterministic
+      --host 0.0.0.0
+      --port 8545
+      --chainId 31338
+      --networkId 31338
+      --gasLimit 12000000
+      --gasPrice 1000000000
+      --defaultBalanceEther 1000
+      --unlock 0
+      --secure false
+      --db /data
+    volumes:
+      - avalanche_chain_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8545 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Mock Price Oracle Service
+  price-oracle-mock:
+    build:
+      context: .
+      dockerfile: Dockerfile.price-oracle
+    ports:
+      - "3003:3003"
+    environment:
+      - PORT=3003
+      - REDIS_URL=redis://redis-test:6379
+    depends_on:
+      redis-test:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3003/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Relayer Service for testing
+  relayer-test:
+    build:
+      context: ../../apps/relayer
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=test
+      - DATABASE_URL=postgresql://test_user:test_password@postgres-test:5432/bastion_test
+      - REDIS_URL=redis://redis-test:6379
+      - DOMA_RPC_URL=http://doma-chain:8545
+      - AVALANCHE_RPC_URL=http://avalanche-chain:8545
+      - LOG_LEVEL=warn
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      redis-test:
+        condition: service_healthy
+      doma-chain:
+        condition: service_healthy
+      avalanche-chain:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Valuation API for testing
+  valuation-api-test:
+    build:
+      context: ../../apps/valuation-api
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=test
+      - DATABASE_URL=postgresql://test_user:test_password@postgres-test:5432/bastion_test
+      - REDIS_URL=redis://redis-test:6379
+      - PRICE_ORACLE_URL=http://price-oracle-mock:3003
+    depends_on:
+      postgres-test:
+        condition: service_healthy
+      redis-test:
+        condition: service_healthy
+      price-oracle-mock:
+        condition: service_healthy
+    ports:
+      - "3002:3002"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3002/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  postgres_test_data:
+  redis_test_data:
+  doma_chain_data:
+  avalanche_chain_data:
+
+networks:
+  default:
+    name: bastion-test-network
