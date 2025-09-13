@@ -351,3 +351,13 @@ export async function deployLiquidationTestFixture(): Promise<{
 
   return { contracts, signers, underwaterPositions };
 }
+
+/**
+ * Deploy lending system for testing
+ */
+export async function deployLendingFixture(): Promise<{
+  contracts: DeployedContracts;
+  signers: TestSigners;
+}> {
+  return await deployAvalancheSystemFixture();
+}
