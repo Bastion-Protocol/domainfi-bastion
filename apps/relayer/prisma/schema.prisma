@@ -1,0 +1,43 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model CustodyEvent {
+  id            String   @id @default(cuid())
+  domainTokenId String
+  circleAddress String
+  inVault       Boolean
+  txHash        String   @unique
+  blockNumber   BigInt
+  logIndex      Int
+  processed     Boolean  @default(false)
+  processedAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  mirrorOperations MirrorOperation[]
+
+  @@unique([txHash, logIndex])
+  @@map("custody_events")
+}
+
+model MirrorOperation {
+  id              String   @id @default(cuid())
+  custodyEventId  String
+  operation       String   // "mint" | "burn"
+  mirrorTokenId   String?
+  avalancheTxHash String?
+  status          String   @default("pending") // "pending" | "success" | "failed"
+  error           String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  custodyEvent CustodyEvent @relation(fields: [custodyEventId], references: [id])
+
+  @@map("mirror_operations")
+}
